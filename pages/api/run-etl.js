@@ -1,7 +1,6 @@
 // pages/api/run-etl.js
 // ETL: fetch products (all variants & SKU), images, inventory per location, recent orders.
-// Inserts/updates: products, inventory_levels, locations, orders_lineitems, metrics_daily.
-// Safe paging, enhanced logging for Vercel.
+// Fixed: use variable for GraphQL orders "query" argument to avoid 422.
 
 import { Pool } from 'pg';
 import axios from 'axios';
@@ -80,18 +79,15 @@ export default async function handler(req, res) {
       for (const e of edges) products.push(e.node);
       if (!data.products.pageInfo.hasNextPage) break;
       cursor = edges[edges.length - 1].cursor;
-      // safety cap for serverless
-      if (products.length > 3000) break;
+      if (products.length > 3000) break; // safety cap
     }
 
     // Upsert products + variants (store variant_id as GraphQL GID)
     for (const p of products) {
-      // collect up to first image
       const firstImage = p.images && p.images.edges && p.images.edges[0] ? p.images.edges[0].node.src : null;
       for (const vEdge of (p.variants && p.variants.edges) || []) {
         const v = vEdge.node;
         const sku = (v.sku || '').trim();
-        // Only upsert rows for SKUs (we need SKU to track inventory)
         if (!sku) continue;
         await client.query(
           `INSERT INTO products (sku, title, product_id, variant_id, image, shopify_handle, retail_price, created_at)
@@ -103,7 +99,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // ---------- 2) Fetch Shopify Locations (so we can store names)
+    // ---------- 2) Fetch Shopify Locations
     let locationsMap = {};
     try {
       const locPayload = await shopifyREST('locations.json', { limit: 250 });
@@ -119,7 +115,7 @@ export default async function handler(req, res) {
       console.warn('Could not fetch locations or store them:', e && e.message ? e.message : e);
     }
 
-    // ---------- 3) Build inventory_item_id -> sku map (from variant.inventoryItem.id)
+    // ---------- 3) Build inventory_item_id -> sku map (from products.variant_id)
     const invItemToSku = {};
     const skuRows = await client.query(`SELECT sku, variant_id FROM products WHERE variant_id IS NOT NULL`);
     for (const r of skuRows.rows) {
@@ -129,21 +125,19 @@ export default async function handler(req, res) {
       if (numeric) invItemToSku[numeric.toString()] = r.sku;
     }
 
-    // ---------- 4) Fetch Inventory Levels via REST (paginated via limit; safety cap)
+    // ---------- 4) Fetch Inventory Levels via REST
     const invLevels = [];
     let invPage = 0;
-    let nextPage = true;
     let params = { limit: 250 };
-    while (nextPage) {
+    while (true) {
       invPage += 1;
       const payload = await shopifyREST('inventory_levels.json', params);
       const items = payload.inventory_levels || [];
       invLevels.push(...items);
-      if (items.length < 250 || invPage > 10) nextPage = false;
-      // Note: we don't implement cursor-based REST pagination here — this works for most stores. For very large stores we will implement Link header parsing.
+      if (items.length < 250 || invPage > 10) break;
     }
 
-    // Upsert inventory_levels rows and aggregate
+    // Upsert inventory_levels
     for (const item of invLevels) {
       const invItemId = item.inventory_item_id ? String(item.inventory_item_id) : null;
       const sku = invItemToSku[invItemId] || (item.sku || null);
@@ -157,15 +151,15 @@ export default async function handler(req, res) {
       );
     }
 
-    // ---------- 5) Fetch Orders (safe window) and insert line items
-    const daysBack = 60; // fetch 60 days for richer metrics; adjust down if you hit timeouts
-    const since = dayjs().subtract(daysBack, 'day').startOf('day').toISOString();
+    // ---------- 5) Fetch Orders (use GraphQL variable for 'query' to avoid 422)
+    const daysBack = 60;
+    const since = dayjs().subtract(daysBack, 'day').startOf('day').format('YYYY-MM-DD'); // YYYY-MM-DD
     const orders = [];
     let ocursor = null;
     const orderPageSize = 50;
     const ordersQuery = `
-      query fetchOrders($pageSize:Int!, $cursor:String, $since:String!) {
-        orders(first:$pageSize, after:$cursor, query:"created_at:>=$since", sortKey:CREATED_AT) {
+      query fetchOrders($pageSize:Int!, $cursor:String, $q:String!) {
+        orders(first:$pageSize, after:$cursor, query:$q, sortKey:CREATED_AT) {
           edges {
             cursor
             node {
@@ -181,13 +175,15 @@ export default async function handler(req, res) {
         }
       }`;
 
+    const queryString = `created_at:>=${since}`;
+
     while (true) {
-      const data = await shopifyGraphQL(ordersQuery, { pageSize: orderPageSize, cursor: ocursor, since });
+      const data = await shopifyGraphQL(ordersQuery, { pageSize: orderPageSize, cursor: ocursor, q: queryString });
       const edges = (data && data.orders && data.orders.edges) || [];
       for (const e of edges) orders.push(e.node);
       if (!data.orders.pageInfo.hasNextPage) break;
       ocursor = edges[edges.length - 1].cursor;
-      if (orders.length > 5000) break; // safety cap
+      if (orders.length > 5000) break;
     }
 
     for (const o of orders) {
@@ -203,7 +199,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // ---------- 6) Compute metrics (rolling7, rolling30, days_of_cover) and upsert metrics_daily
+    // ---------- 6) Compute metrics and upsert metrics_daily
     const skuListRes = await client.query('SELECT sku FROM products');
     const skus = skuListRes.rows.map(r => r.sku);
     const today = dayjs().format('YYYY-MM-DD');
@@ -216,13 +212,10 @@ export default async function handler(req, res) {
       const daily = {};
       for (const r of salesRes.rows) daily[r.day.toISOString().slice(0,10)] = Number(r.qty || 0);
       const days = [];
-      for (let i = 29; i >= 0; i--) {
-        const d = dayjs().subtract(i, 'day').format('YYYY-MM-DD');
-        days.push(daily[d] || 0);
-      }
-      const sum30 = days.reduce((a, b) => a + b, 0);
+      for (let i = 29; i >= 0; i--) { const d = dayjs().subtract(i, 'day').format('YYYY-MM-DD'); days.push(daily[d] || 0); }
+      const sum30 = days.reduce((a,b)=>a+b,0);
       const avg30 = sum30 / 30;
-      const sum7 = days.slice(-7).reduce((a, b) => a + b, 0);
+      const sum7 = days.slice(-7).reduce((a,b)=>a+b,0);
       const avg7 = sum7 / 7;
       const todaySales = daily[today] || 0;
 
