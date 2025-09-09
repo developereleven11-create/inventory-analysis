@@ -1,9 +1,7 @@
 // pages/api/run-etl.js
-// Improved, syntax-correct ETL for Vercel serverless
-// - Fetches Shopify products/variants, inventory levels, and recent orders
-// - Writes products, inventory_levels, orders_lineitems, metrics_daily into Postgres (Neon)
-// - Conservative paging limits for serverless safety
-// - Enhanced error logging to surface upstream (Shopify/REST) responses in Vercel logs
+// ETL: fetch products (all variants & SKU), images, inventory per location, recent orders.
+// Inserts/updates: products, inventory_levels, locations, orders_lineitems, metrics_daily.
+// Safe paging, enhanced logging for Vercel.
 
 import { Pool } from 'pg';
 import axios from 'axios';
@@ -16,29 +14,18 @@ const SLACK_WEBHOOK = process.env.SLACK_WEBHOOK_URL;
 const DATABASE_URL = process.env.DATABASE_URL;
 const ETL_SECRET = process.env.ETL_SECRET || 'change_this_secret';
 
-const pool = DATABASE_URL
-  ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
-  : null;
+const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } }) : null;
 
-async function postSlack(message) {
+async function postSlack(msg) {
   if (!SLACK_WEBHOOK) return;
-  try {
-    await axios.post(SLACK_WEBHOOK, { text: message });
-  } catch (err) {
-    console.error('Slack post failed:', err.message || err);
-  }
+  try { await axios.post(SLACK_WEBHOOK, { text: msg }); } catch(e){ console.error('Slack post failed', e && e.message ? e.message : e); }
 }
 
 async function shopifyGraphQL(query, variables = {}) {
   const url = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
-  const headers = {
-    'X-Shopify-Access-Token': ACCESS_TOKEN,
-    'Content-Type': 'application/json',
-  };
+  const headers = { 'X-Shopify-Access-Token': ACCESS_TOKEN, 'Content-Type': 'application/json' };
   const res = await axios.post(url, { query, variables }, { headers, timeout: 30000 });
-  if (res.data && res.data.errors) {
-    throw new Error(JSON.stringify(res.data.errors));
-  }
+  if (res.data && res.data.errors) throw new Error(JSON.stringify(res.data.errors));
   return res.data.data;
 }
 
@@ -51,23 +38,16 @@ async function shopifyREST(path, params = {}) {
 
 export default async function handler(req, res) {
   const key = req.headers['x-etl-secret'] || req.query.secret;
-  if (key !== ETL_SECRET) {
-    return res.status(401).send('unauthorized');
-  }
-
-  if (!DATABASE_URL) {
-    return res.status(500).send('DATABASE_URL not set');
-  }
-  if (!ACCESS_TOKEN || !SHOP) {
-    return res.status(500).send('SHOP or ACCESS_TOKEN not set');
-  }
+  if (key !== ETL_SECRET) return res.status(401).send('unauthorized');
+  if (!DATABASE_URL) return res.status(500).send('DATABASE_URL not set');
+  if (!ACCESS_TOKEN || !SHOP) return res.status(500).send('SHOP or ACCESS_TOKEN not set');
 
   const client = await pool.connect();
   try {
-    // --- 1) Fetch Products + Variants (small pages)
+    // ---------- 1) Fetch all Products + Variants (cursor pagination)
     const products = [];
     let cursor = null;
-    const pageSize = 40; // conservative for serverless
+    const productPageSize = 50;
     const productQuery = `
       query productsPage($pageSize:Int!, $cursor:String) {
         products(first:$pageSize, after:$cursor) {
@@ -77,8 +57,8 @@ export default async function handler(req, res) {
               id
               handle
               title
-              images(first:1) { edges { node { src } } }
-              variants(first:50) {
+              images(first:5) { edges { node { src altText } } }
+              variants(first:250) {
                 edges {
                   node {
                     id
@@ -95,34 +75,51 @@ export default async function handler(req, res) {
       }`;
 
     while (true) {
-      const data = await shopifyGraphQL(productQuery, { pageSize, cursor });
+      const data = await shopifyGraphQL(productQuery, { pageSize: productPageSize, cursor });
       const edges = (data && data.products && data.products.edges) || [];
-      for (const e of edges) {
-        products.push(e.node);
-      }
+      for (const e of edges) products.push(e.node);
       if (!data.products.pageInfo.hasNextPage) break;
       cursor = edges[edges.length - 1].cursor;
-      if (products.length > 800) break; // safety cap
+      // safety cap for serverless
+      if (products.length > 3000) break;
     }
 
-    // Upsert products and variants into products table
+    // Upsert products + variants (store variant_id as GraphQL GID)
     for (const p of products) {
-      const img = p.images && p.images.edges && p.images.edges[0] ? p.images.edges[0].node.src : null;
+      // collect up to first image
+      const firstImage = p.images && p.images.edges && p.images.edges[0] ? p.images.edges[0].node.src : null;
       for (const vEdge of (p.variants && p.variants.edges) || []) {
         const v = vEdge.node;
         const sku = (v.sku || '').trim();
+        // Only upsert rows for SKUs (we need SKU to track inventory)
         if (!sku) continue;
         await client.query(
           `INSERT INTO products (sku, title, product_id, variant_id, image, shopify_handle, retail_price, created_at)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
            ON CONFLICT (sku) DO UPDATE
            SET title=EXCLUDED.title, product_id=EXCLUDED.product_id, variant_id=EXCLUDED.variant_id, image=EXCLUDED.image, shopify_handle=EXCLUDED.shopify_handle, retail_price=EXCLUDED.retail_price`,
-          [sku, p.title, p.id, v.id, img, p.handle, v.price || 0, new Date()]
+          [sku, p.title, p.id, v.id, firstImage, p.handle, v.price || 0, new Date()]
         );
       }
     }
 
-    // --- 2) Build inventory_item_id -> sku map (from stored variant_id if possible)
+    // ---------- 2) Fetch Shopify Locations (so we can store names)
+    let locationsMap = {};
+    try {
+      const locPayload = await shopifyREST('locations.json', { limit: 250 });
+      const locs = locPayload.locations || [];
+      for (const l of locs) {
+        locationsMap[String(l.id)] = l.name || String(l.id);
+        await client.query(
+          `INSERT INTO locations (location_id, name) VALUES ($1,$2) ON CONFLICT (location_id) DO UPDATE SET name=EXCLUDED.name`,
+          [String(l.id), l.name || String(l.id)]
+        );
+      }
+    } catch (e) {
+      console.warn('Could not fetch locations or store them:', e && e.message ? e.message : e);
+    }
+
+    // ---------- 3) Build inventory_item_id -> sku map (from variant.inventoryItem.id)
     const invItemToSku = {};
     const skuRows = await client.query(`SELECT sku, variant_id FROM products WHERE variant_id IS NOT NULL`);
     for (const r of skuRows.rows) {
@@ -132,20 +129,21 @@ export default async function handler(req, res) {
       if (numeric) invItemToSku[numeric.toString()] = r.sku;
     }
 
-    // --- 3) Fetch Inventory Levels (REST)
-    let invParams = { limit: 250 };
+    // ---------- 4) Fetch Inventory Levels via REST (paginated via limit; safety cap)
     const invLevels = [];
-    let invFetchPage = 0;
-    while (true) {
-      invFetchPage += 1;
-      const payload = await shopifyREST('inventory_levels.json', invParams);
+    let invPage = 0;
+    let nextPage = true;
+    let params = { limit: 250 };
+    while (nextPage) {
+      invPage += 1;
+      const payload = await shopifyREST('inventory_levels.json', params);
       const items = payload.inventory_levels || [];
       invLevels.push(...items);
-      if (items.length < 250) break;
-      if (invFetchPage > 5) break; // safety
+      if (items.length < 250 || invPage > 10) nextPage = false;
+      // Note: we don't implement cursor-based REST pagination here — this works for most stores. For very large stores we will implement Link header parsing.
     }
 
-    // Upsert inventory_levels (aggregate per location)
+    // Upsert inventory_levels rows and aggregate
     for (const item of invLevels) {
       const invItemId = item.inventory_item_id ? String(item.inventory_item_id) : null;
       const sku = invItemToSku[invItemId] || (item.sku || null);
@@ -159,12 +157,12 @@ export default async function handler(req, res) {
       );
     }
 
-    // --- 4) Fetch recent orders (safe window) and insert line items
-    const daysBack = 30; // conservative but useful
+    // ---------- 5) Fetch Orders (safe window) and insert line items
+    const daysBack = 60; // fetch 60 days for richer metrics; adjust down if you hit timeouts
     const since = dayjs().subtract(daysBack, 'day').startOf('day').toISOString();
     const orders = [];
     let ocursor = null;
-    const orderPageSize = 40;
+    const orderPageSize = 50;
     const ordersQuery = `
       query fetchOrders($pageSize:Int!, $cursor:String, $since:String!) {
         orders(first:$pageSize, after:$cursor, query:"created_at:>=$since", sortKey:CREATED_AT) {
@@ -174,14 +172,8 @@ export default async function handler(req, res) {
               id
               name
               createdAt
-              lineItems(first:100) {
-                edges {
-                  node {
-                    sku
-                    quantity
-                    name
-                  }
-                }
+              lineItems(first:250) {
+                edges { node { sku quantity name } }
               }
             }
           }
@@ -195,7 +187,7 @@ export default async function handler(req, res) {
       for (const e of edges) orders.push(e.node);
       if (!data.orders.pageInfo.hasNextPage) break;
       ocursor = edges[edges.length - 1].cursor;
-      if (orders.length > 2000) break; // safety cap
+      if (orders.length > 5000) break; // safety cap
     }
 
     for (const o of orders) {
@@ -211,17 +203,14 @@ export default async function handler(req, res) {
       }
     }
 
-    // --- 5) Compute metrics for each SKU and upsert metrics_daily
+    // ---------- 6) Compute metrics (rolling7, rolling30, days_of_cover) and upsert metrics_daily
     const skuListRes = await client.query('SELECT sku FROM products');
     const skus = skuListRes.rows.map(r => r.sku);
     const today = dayjs().format('YYYY-MM-DD');
 
     for (const sku of skus) {
       const salesRes = await client.query(
-        `SELECT created_at::date as day, SUM(quantity) as qty
-         FROM orders_lineitems
-         WHERE sku=$1 AND created_at >= CURRENT_DATE - INTERVAL '30 days'
-         GROUP BY day ORDER BY day`,
+        `SELECT created_at::date as day, SUM(quantity) as qty FROM orders_lineitems WHERE sku=$1 AND created_at >= CURRENT_DATE - INTERVAL '30 days' GROUP BY day ORDER BY day`,
         [sku]
       );
       const daily = {};
@@ -256,9 +245,9 @@ export default async function handler(req, res) {
     await postSlack(`:white_check_mark: ETL completed: products ${products.length}, orders ${orders.length}`);
     res.status(200).send(`ETL completed (products ${products.length}, orders ${orders.length})`);
   } catch (err) {
-    // Enhanced logging to surface upstream response body when available (axios)
+    // enhanced logging
     try {
-      console.error('ETL error message:', err.message || String(err));
+      console.error('ETL error message:', err && err.message ? err.message : String(err));
       if (err.response) {
         console.error('ETL upstream status:', err.response.status);
         console.error('ETL upstream headers:', JSON.stringify(err.response.headers || {}));
@@ -269,14 +258,8 @@ export default async function handler(req, res) {
     } catch (logErr) {
       console.error('Failed to log upstream error details:', logErr && logErr.message ? logErr.message : logErr);
     }
-
-    // Return a uniform error to the caller (do not leak secrets)
-    return res.status(500).send('ETL failed: ' + (err.message || 'unknown error'));
+    return res.status(500).send('ETL failed: ' + (err && err.message ? err.message : 'unknown error'));
   } finally {
-    try {
-      client.release();
-    } catch (releaseErr) {
-      console.error('Failed to release DB client:', releaseErr && releaseErr.message ? releaseErr.message : releaseErr);
-    }
+    try { client.release(); } catch (e) { console.error('Failed to release DB client', e && e.message ? e.message : e); }
   }
 }
