@@ -10,7 +10,7 @@ function Badge({children, type}) {
 }
 
 export default function Dashboard() {
-  const {data, error} = useSWR('/api/mock-skus', fetcher, {fallbackData: {skus:[]}});
+  const {data, error} = useSWR('/api/skus-live', fetcher, {fallbackData: {skus:[]}});
 
   const skus = data.skus || [];
   const totalSKUs = skus.length;
