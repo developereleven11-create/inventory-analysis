@@ -1,6 +1,6 @@
 // pages/api/run-etl.js
-// ETL: fetch products (all variants & SKU), images, inventory per location, recent orders.
-// Fixed: use variable for GraphQL orders "query" argument to avoid 422.
+// ETL with diagnostic logging: logs operation name + variables before each Shopify call,
+// and prints upstream status/body on error for easy diagnosis in Vercel logs.
 
 import { Pool } from 'pg';
 import axios from 'axios';
@@ -20,19 +20,18 @@ async function postSlack(msg) {
   try { await axios.post(SLACK_WEBHOOK, { text: msg }); } catch(e){ console.error('Slack post failed', e && e.message ? e.message : e); }
 }
 
-async function shopifyGraphQL(query, variables = {}) {
+async function shopifyGraphQL(opName, query, variables = {}) {
   const url = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
+  console.log(`SHOPIFY: graphql op=${opName} url=${url} variables=${JSON.stringify(variables)}`);
   const headers = { 'X-Shopify-Access-Token': ACCESS_TOKEN, 'Content-Type': 'application/json' };
-  const res = await axios.post(url, { query, variables }, { headers, timeout: 30000 });
-  if (res.data && res.data.errors) throw new Error(JSON.stringify(res.data.errors));
-  return res.data.data;
+  return axios.post(url, { query, variables }, { headers, timeout: 30000 });
 }
 
-async function shopifyREST(path, params = {}) {
+async function shopifyREST(opName, path, params = {}) {
   const url = `https://${SHOP}/admin/api/${API_VERSION}/${path}`;
+  console.log(`SHOPIFY: rest op=${opName} url=${url} params=${JSON.stringify(params)}`);
   const headers = { 'X-Shopify-Access-Token': ACCESS_TOKEN };
-  const res = await axios.get(url, { headers, params, timeout: 30000 });
-  return res.data;
+  return axios.get(url, { headers, params, timeout: 30000 });
 }
 
 export default async function handler(req, res) {
@@ -43,7 +42,7 @@ export default async function handler(req, res) {
 
   const client = await pool.connect();
   try {
-    // ---------- 1) Fetch all Products + Variants (cursor pagination)
+    // 1) Products pagination
     const products = [];
     let cursor = null;
     const productPageSize = 50;
@@ -74,15 +73,22 @@ export default async function handler(req, res) {
       }`;
 
     while (true) {
-      const data = await shopifyGraphQL(productQuery, { pageSize: productPageSize, cursor });
+      const op = 'productsPage';
+      const variables = { pageSize: productPageSize, cursor };
+      const resp = await shopifyGraphQL(op, productQuery, variables);
+      if (resp.status !== 200) {
+        console.error(`SHOPIFY CALL FAILED — op=${op} url=graphql status=${resp.status} body=${JSON.stringify(resp.data||{})}`);
+        throw new Error(`Shopify ${op} failed with status ${resp.status}`);
+      }
+      const data = resp.data && resp.data.data;
       const edges = (data && data.products && data.products.edges) || [];
       for (const e of edges) products.push(e.node);
       if (!data.products.pageInfo.hasNextPage) break;
       cursor = edges[edges.length - 1].cursor;
-      if (products.length > 3000) break; // safety cap
+      if (products.length > 3000) break;
     }
 
-    // Upsert products + variants (store variant_id as GraphQL GID)
+    // Upsert products & variants
     for (const p of products) {
       const firstImage = p.images && p.images.edges && p.images.edges[0] ? p.images.edges[0].node.src : null;
       for (const vEdge of (p.variants && p.variants.edges) || []) {
@@ -99,23 +105,28 @@ export default async function handler(req, res) {
       }
     }
 
-    // ---------- 2) Fetch Shopify Locations
-    let locationsMap = {};
+    // 2) Locations
     try {
-      const locPayload = await shopifyREST('locations.json', { limit: 250 });
+      const op = 'locations';
+      const resp = await shopifyREST(op, 'locations.json', { limit: 250 });
+      if (resp.status && resp.status !== 200) {
+        console.error(`SHOPIFY CALL FAILED — op=${op} url=locations.json status=${resp.status} body=${JSON.stringify(resp.data||{})}`);
+        throw new Error(`Shopify ${op} failed with status ${resp.status}`);
+      }
+      const locPayload = resp.data || resp; // axios returns {data:...}, but we also accept raw payload
       const locs = locPayload.locations || [];
       for (const l of locs) {
-        locationsMap[String(l.id)] = l.name || String(l.id);
         await client.query(
           `INSERT INTO locations (location_id, name) VALUES ($1,$2) ON CONFLICT (location_id) DO UPDATE SET name=EXCLUDED.name`,
           [String(l.id), l.name || String(l.id)]
         );
       }
     } catch (e) {
-      console.warn('Could not fetch locations or store them:', e && e.message ? e.message : e);
+      console.warn('Locations fetch warning:', e && e.message ? e.message : e);
+      // continue — locations optional
     }
 
-    // ---------- 3) Build inventory_item_id -> sku map (from products.variant_id)
+    // 3) Build inventory_item -> sku map from products.variant_id
     const invItemToSku = {};
     const skuRows = await client.query(`SELECT sku, variant_id FROM products WHERE variant_id IS NOT NULL`);
     for (const r of skuRows.rows) {
@@ -125,19 +136,23 @@ export default async function handler(req, res) {
       if (numeric) invItemToSku[numeric.toString()] = r.sku;
     }
 
-    // ---------- 4) Fetch Inventory Levels via REST
+    // 4) Inventory levels (REST)
     const invLevels = [];
     let invPage = 0;
-    let params = { limit: 250 };
     while (true) {
+      const op = 'inventory_levels';
       invPage += 1;
-      const payload = await shopifyREST('inventory_levels.json', params);
+      const resp = await shopifyREST(op, 'inventory_levels.json', { limit: 250 });
+      if (resp.status && resp.status !== 200) {
+        console.error(`SHOPIFY CALL FAILED — op=${op} url=inventory_levels.json status=${resp.status} body=${JSON.stringify(resp.data||{})}`);
+        throw new Error(`Shopify ${op} failed with status ${resp.status}`);
+      }
+      const payload = resp.data || resp;
       const items = payload.inventory_levels || [];
       invLevels.push(...items);
       if (items.length < 250 || invPage > 10) break;
     }
 
-    // Upsert inventory_levels
     for (const item of invLevels) {
       const invItemId = item.inventory_item_id ? String(item.inventory_item_id) : null;
       const sku = invItemToSku[invItemId] || (item.sku || null);
@@ -151,9 +166,9 @@ export default async function handler(req, res) {
       );
     }
 
-    // ---------- 5) Fetch Orders (use GraphQL variable for 'query' to avoid 422)
+    // 5) Orders (use GraphQL variable q)
     const daysBack = 60;
-    const since = dayjs().subtract(daysBack, 'day').startOf('day').format('YYYY-MM-DD'); // YYYY-MM-DD
+    const since = dayjs().subtract(daysBack, 'day').startOf('day').format('YYYY-MM-DD');
     const orders = [];
     let ocursor = null;
     const orderPageSize = 50;
@@ -174,11 +189,17 @@ export default async function handler(req, res) {
           pageInfo { hasNextPage }
         }
       }`;
-
     const queryString = `created_at:>=${since}`;
 
     while (true) {
-      const data = await shopifyGraphQL(ordersQuery, { pageSize: orderPageSize, cursor: ocursor, q: queryString });
+      const op = 'ordersQuery';
+      const variables = { pageSize: orderPageSize, cursor: ocursor, q: queryString };
+      const resp = await shopifyGraphQL(op, ordersQuery, variables);
+      if (resp.status !== 200) {
+        console.error(`SHOPIFY CALL FAILED — op=${op} url=graphql status=${resp.status} body=${JSON.stringify(resp.data||{})} variables=${JSON.stringify(variables)}`);
+        throw new Error(`Shopify ${op} failed with status ${resp.status}`);
+      }
+      const data = resp.data && resp.data.data;
       const edges = (data && data.orders && data.orders.edges) || [];
       for (const e of edges) orders.push(e.node);
       if (!data.orders.pageInfo.hasNextPage) break;
@@ -199,7 +220,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // ---------- 6) Compute metrics and upsert metrics_daily
+    // 6) Metrics generation
     const skuListRes = await client.query('SELECT sku FROM products');
     const skus = skuListRes.rows.map(r => r.sku);
     const today = dayjs().format('YYYY-MM-DD');
@@ -238,7 +259,7 @@ export default async function handler(req, res) {
     await postSlack(`:white_check_mark: ETL completed: products ${products.length}, orders ${orders.length}`);
     res.status(200).send(`ETL completed (products ${products.length}, orders ${orders.length})`);
   } catch (err) {
-    // enhanced logging
+    // Enhanced logging: include op info if present in earlier logs
     try {
       console.error('ETL error message:', err && err.message ? err.message : String(err));
       if (err.response) {
