@@ -232,9 +232,23 @@ export default async function handler(req, res) {
 
     await postSlack(`:white_check_mark: ETL completed: products ${products.length}, orders ${orders.length}`);
     return res.status(200).send(`ETL completed (products ${products.length}, orders ${orders.length})`);
-  } catch (err) {
-    console.error('ETL error', err);
-    return res.status(500).send('ETL failed: ' + (err.message||err));
+  }   } catch (err) {
+    // enhanced logging to capture upstream response bodies (Shopify / REST)
+    console.error('ETL error message:', err.message);
+    // Axios-specific info
+    if (err.response) {
+      try {
+        console.error('ETL upstream status:', err.response.status);
+        console.error('ETL upstream headers:', JSON.stringify(err.response.headers));
+        // Print response body safely (may contain non-sensitive info)
+        console.error('ETL upstream body:', JSON.stringify(err.response.data));
+      } catch (e) {
+        console.error('Failed to stringify upstream response', e.message);
+      }
+    } else {
+      console.error('ETL no response object on error.');
+    }
+    return res.status(500).send('ETL failed: ' + (err.message || err));
   } finally {
     client.release();
   }
