@@ -166,9 +166,11 @@ export default async function handler(req, res) {
       );
     }
 
-    // 5) Orders (use GraphQL variable q)
+    // ---------- 5) Fetch Orders (use GraphQL variable q) — REPLACEMENT BLOCK
     const daysBack = 60;
-    const since = dayjs().subtract(daysBack, 'day').startOf('day').format('YYYY-MM-DD');
+    // Use full ISO date-time and include quotes in the query string for Shopify
+    const sinceIso = dayjs().subtract(daysBack, 'day').startOf('day').toISOString(); // e.g. 2025-07-01T00:00:00.000Z
+    const sinceForQuery = sinceIso.split('.')[0] + 'Z'; // remove ms, keep Z
     const orders = [];
     let ocursor = null;
     const orderPageSize = 50;
@@ -189,22 +191,24 @@ export default async function handler(req, res) {
           pageInfo { hasNextPage }
         }
       }`;
-    const queryString = `created_at:>=${since}`;
+    // Format with quotes around the timestamp (Shopify expects a quoted value)
+    const queryString = `created_at:>="${sinceForQuery}"`;
 
     while (true) {
       const op = 'ordersQuery';
       const variables = { pageSize: orderPageSize, cursor: ocursor, q: queryString };
+      console.log(`SHOPIFY: graphql op=${op} variables=${JSON.stringify(variables)}`);
       const resp = await shopifyGraphQL(op, ordersQuery, variables);
-      if (resp.status !== 200) {
-        console.error(`SHOPIFY CALL FAILED — op=${op} url=graphql status=${resp.status} body=${JSON.stringify(resp.data||{})} variables=${JSON.stringify(variables)}`);
-        throw new Error(`Shopify ${op} failed with status ${resp.status}`);
+      if (!resp || resp.status !== 200) {
+        console.error(`SHOPIFY CALL FAILED — op=${op} url=graphql status=${resp && resp.status} body=${JSON.stringify(resp && resp.data || {})} variables=${JSON.stringify(variables)}`);
+        throw new Error(`Shopify ${op} failed with status ${resp && resp.status}`);
       }
       const data = resp.data && resp.data.data;
       const edges = (data && data.orders && data.orders.edges) || [];
       for (const e of edges) orders.push(e.node);
       if (!data.orders.pageInfo.hasNextPage) break;
       ocursor = edges[edges.length - 1].cursor;
-      if (orders.length > 5000) break;
+      if (orders.length > 5000) break; // safety cap
     }
 
     for (const o of orders) {
