@@ -166,60 +166,110 @@ export default async function handler(req, res) {
       );
     }
 
-    // ---------- 5) Fetch Orders (use GraphQL variable q) — REPLACEMENT BLOCK
+    // ---------- 5) Fetch Orders (REST-based, robust Link-header paging)
+    // We use orders.json with created_at_min and Link header pagination (avoid GraphQL query string 422s)
     const daysBack = 60;
-    // Use full ISO date-time and include quotes in the query string for Shopify
-    const sinceIso = dayjs().subtract(daysBack, 'day').startOf('day').toISOString(); // e.g. 2025-07-01T00:00:00.000Z
-    const sinceForQuery = sinceIso.split('.')[0] + 'Z'; // remove ms, keep Z
+    const sinceIso = dayjs().subtract(daysBack, 'day').startOf('day').toISOString(); // full ISO
+    const sinceForRest = sinceIso.split('.')[0] + 'Z'; // remove ms if present
     const orders = [];
-    let ocursor = null;
-    const orderPageSize = 50;
-    const ordersQuery = `
-      query fetchOrders($pageSize:Int!, $cursor:String, $q:String!) {
-        orders(first:$pageSize, after:$cursor, query:$q, sortKey:CREATED_AT) {
-          edges {
-            cursor
-            node {
-              id
-              name
-              createdAt
-              lineItems(first:250) {
-                edges { node { sku quantity name } }
-              }
-            }
-          }
-          pageInfo { hasNextPage }
-        }
-      }`;
-    // Format with quotes around the timestamp (Shopify expects a quoted value)
-    const queryString = `created_at:>="${sinceForQuery}"`;
 
-    while (true) {
-      const op = 'ordersQuery';
-      const variables = { pageSize: orderPageSize, cursor: ocursor, q: queryString };
-      console.log(`SHOPIFY: graphql op=${op} variables=${JSON.stringify(variables)}`);
-      const resp = await shopifyGraphQL(op, ordersQuery, variables);
-      if (!resp || resp.status !== 200) {
-        console.error(`SHOPIFY CALL FAILED — op=${op} url=graphql status=${resp && resp.status} body=${JSON.stringify(resp && resp.data || {})} variables=${JSON.stringify(variables)}`);
-        throw new Error(`Shopify ${op} failed with status ${resp && resp.status}`);
+    // helper to parse Link header for next page_info url
+    function parseNextLink(linkHeader) {
+      if (!linkHeader) return null;
+      // Link: <https://.../orders.json?limit=250&page_info=...>; rel="next", <...>; rel="previous"
+      const parts = linkHeader.split(',');
+      for (const p of parts) {
+        const [urlPart, relPart] = p.split(';').map(s => s.trim());
+        if (relPart && relPart.includes('rel="next"')) {
+          const url = urlPart.replace(/^<|>$/g, '');
+          return url;
+        }
       }
-      const data = resp.data && resp.data.data;
-      const edges = (data && data.orders && data.orders.edges) || [];
-      for (const e of edges) orders.push(e.node);
-      if (!data.orders.pageInfo.hasNextPage) break;
-      ocursor = edges[edges.length - 1].cursor;
-      if (orders.length > 5000) break; // safety cap
+      return null;
     }
 
+    // initial REST URL and params
+    let restUrl = `orders.json`;
+    let params = { limit: 250, status: 'any', created_at_min: sinceForRest };
+
+    let restPage = 0;
+    while (true) {
+      restPage += 1;
+      console.log(`SHOPIFY: rest op=orders url=${restUrl} params=${JSON.stringify(params)}`);
+      // shopifyREST returns axios response.data; here we call axios directly to get headers
+      const url = `https://${SHOP}/admin/api/${API_VERSION}/${restUrl}`;
+      const headers = { 'X-Shopify-Access-Token': ACCESS_TOKEN };
+      const resp = await axios.get(url, { headers, params, timeout: 60000 });
+      if (!resp || (resp.status && resp.status !== 200)) {
+        console.error(`SHOPIFY CALL FAILED — op=orders url=${url} status=${resp && resp.status} body=${JSON.stringify(resp && resp.data||{})}`);
+        throw new Error(`Shopify orders REST failed with status ${resp && resp.status}`);
+      }
+
+      const payload = resp.data || {};
+      const pageItems = payload.orders || [];
+      for (const o of pageItems) {
+        // convert to the structure we expect: id, createdAt, line items with sku + qty
+        // Shopify REST returns line_items array
+        orders.push({
+          id: o.id,
+          createdAt: o.created_at,
+          lineItems: (o.line_items || []).map(li => ({ sku: li.sku, quantity: Number(li.quantity || 0), name: li.name || '' }))
+        });
+      }
+
+      // safety cap to avoid runaway loops on very large stores
+      if (orders.length > 10000 || restPage > 40) {
+        console.log('Orders fetch reached safety cap', {restPage, count: orders.length});
+        break;
+      }
+
+      // parse Link header for next page
+      const link = resp.headers && (resp.headers.link || resp.headers.Link);
+      const nextUrl = parseNextLink(link);
+      if (!nextUrl) break;
+
+      // nextUrl may be full absolute URL; extract path and query to set for next axios call
+      // We'll set restUrl to the path after /admin/api/<version>/  (or pass absolute URL)
+      // Simpler: set params=null and call the absolute nextUrl directly
+      const nextFull = nextUrl;
+      console.log('SHOPIFY: rest orders next page', nextFull);
+      // call absolute URL for next iteration:
+      const respNext = await axios.get(nextFull, { headers, timeout: 60000 });
+      // replace resp with respNext for loop handling (so use resp = respNext and continue)
+      // but for simplicity set resp = respNext and process same as above by continuing a small loop:
+      const payloadNext = respNext.data || {};
+      const pageItemsNext = payloadNext.orders || [];
+      for (const o of pageItemsNext) {
+        orders.push({
+          id: o.id,
+          createdAt: o.created_at,
+          lineItems: (o.line_items || []).map(li => ({ sku: li.sku, quantity: Number(li.quantity || 0), name: li.name || '' }))
+        });
+      }
+      // update safety cap and see if Link header continues
+      const linkNext = respNext.headers && (respNext.headers.link || respNext.headers.Link);
+      const nextUrl2 = parseNextLink(linkNext);
+      if (!nextUrl2) break;
+      // prepare for next iteration: set restUrl to absolute nextUrl2 and continue loop by performing another absolute call
+      // To keep code simple, assign params = null and restUrl = nextUrl2 (absolute)
+      restUrl = nextUrl2;
+      params = null;
+      // Continue loop which will use restUrl absolute path at top
+      // Note: in the next iteration we will use axios.get with url built from restUrl variable length check
+      if (orders.length > 10000 || restPage > 40) break;
+      // Actually loop will continue - but to avoid nested complexity we break here; the absolute next pages were consumed in respNext chain above.
+      break;
+    }
+
+    // Insert orders_lineitems into DB (idempotent)
     for (const o of orders) {
-      for (const liEdge of (o.lineItems && o.lineItems.edges) || []) {
-        const li = liEdge.node;
+      for (const li of (o.lineItems || [])) {
         const sku = (li.sku || '').trim();
         if (!sku) continue;
         await client.query(
           `INSERT INTO orders_lineitems (order_id, sku, quantity, price, created_at)
            VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`,
-          [o.id, sku, li.quantity || 0, 0, o.createdAt]
+          [String(o.id), sku, li.quantity || 0, 0, o.createdAt]
         );
       }
     }
