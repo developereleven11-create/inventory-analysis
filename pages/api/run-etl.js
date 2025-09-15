@@ -145,51 +145,82 @@ for (const p of products) {
       console.warn('Locations fetch warning:', e && e.message ? e.message : e);
     }
 
-    // ---------- 3) Inventory Levels (REST)
+    // --- Robust inventory processing (replacement)
+    console.log('INVENTORY: start');
     const invLevels = [];
     try {
-      let nextUrl = null;
-      // initial call
+      // first page
       const firstInvResp = await shopifyREST('inventory_levels', 'inventory_levels.json', { limit: 250 });
-      if (!firstInvResp) throw new Error('inventory_levels initial response empty');
       const firstPayload = firstInvResp.data || firstInvResp;
       invLevels.push(...(firstPayload.inventory_levels || []));
-      const linkHeader = (firstInvResp.headers && (firstInvResp.headers.link || firstInvResp.headers.Link)) || null;
-      nextUrl = parseLinkHeader(linkHeader);
+
+      // follow Link header
+      const parseLink = (str) => {
+        if (!str) return null;
+        const parts = str.split(',');
+        for (const p of parts) {
+          const [urlPart, relPart] = p.split(';').map(s => s.trim());
+          if (relPart && relPart.includes('rel="next"')) return urlPart.replace(/^<|>$/g, '');
+        }
+        return null;
+      };
+
+      let nextInv = (firstInvResp.headers && (firstInvResp.headers.link || firstInvResp.headers.Link)) || null;
       let pages = 0;
-      while (nextUrl && pages < 10) {
-        pages += 1;
-        const nextResp = await shopifyREST('inventory_levels_next', nextUrl, {}, true);
+      while (nextInv && pages < 20) {
+        pages++;
+        const nextResp = await shopifyREST('inventory_levels_next', nextInv, {}, true);
         const payload = nextResp.data || nextResp;
         invLevels.push(...(payload.inventory_levels || []));
         const lh = (nextResp.headers && (nextResp.headers.link || nextResp.headers.Link)) || null;
-        nextUrl = parseLinkHeader(lh);
+        nextInv = parseLink(lh);
       }
     } catch (e) {
-      console.warn('Inventory fetch warning:', e && e.message ? e.message : e);
+      console.warn('INVENTORY fetch failed:', e && e.message ? e.message : e);
     }
 
-  // Build inventory_item_id -> sku map from products.inventory_item_id
-const invItemToSku = {};
-const skuRows = await client.query(`SELECT sku, inventory_item_id FROM products WHERE inventory_item_id IS NOT NULL`);
-for (const r of skuRows.rows) {
-  const invId = r.inventory_item_id ? String(r.inventory_item_id) : null;
-  if (invId) invItemToSku[invId] = r.sku;
-}
+    // Build mapping from inventory_item_id -> sku from products
+    const invItemToSku = {};
+    const skuRows = await client.query(`SELECT sku, inventory_item_id FROM products WHERE inventory_item_id IS NOT NULL`);
+    for (const r of skuRows.rows) if (r.inventory_item_id) invItemToSku[String(r.inventory_item_id)] = r.sku;
 
+    // Counters for debug
+    let totalInv = 0, mapped = 0, autopopulated = 0, inserted = 0;
 
     for (const item of invLevels) {
+      totalInv++;
       const invItemId = item.inventory_item_id ? String(item.inventory_item_id) : null;
-      const sku = invItemToSku[invItemId] || (item.sku || null);
-      if (!sku) continue;
+      const skuFromRow = item.sku ? String(item.sku).trim() : null;
+      let sku = invItemId && invItemToSku[invItemId] ? invItemToSku[invItemId] : null;
+
+      // If missing, but inventory row carries sku, backfill products.inventory_item_id
+      if (!sku && skuFromRow) {
+        const pcheck = await client.query(`SELECT sku FROM products WHERE sku=$1 LIMIT 1`, [skuFromRow]);
+        if (pcheck.rowCount === 1) {
+          await client.query(`UPDATE products SET inventory_item_id=$1 WHERE sku=$2`, [invItemId, skuFromRow]);
+          invItemToSku[invItemId] = skuFromRow;
+          sku = skuFromRow;
+          autopopulated++;
+        }
+      }
+
+      if (sku) mapped++;
+
       const locationId = String(item.location_id || 'unknown');
-      await client.query(
-        `INSERT INTO inventory_levels (sku, location_id, available, timestamp)
-         VALUES ($1,$2,$3,$4)
-         ON CONFLICT (sku, location_id) DO UPDATE SET available=EXCLUDED.available, timestamp=EXCLUDED.timestamp`,
-        [sku, locationId, item.available || 0, new Date()]
-      );
+      try {
+        await client.query(
+          `INSERT INTO inventory_levels (sku, location_id, available, timestamp, inventory_item_id)
+           VALUES ($1,$2,$3,$4,$5)
+           ON CONFLICT (sku, location_id) DO UPDATE SET available=EXCLUDED.available, timestamp=EXCLUDED.timestamp, inventory_item_id=EXCLUDED.inventory_item_id`,
+          [sku || skuFromRow || (invItemId ? ('invitem_' + invItemId) : null), locationId, item.available || 0, new Date(), invItemId]
+        );
+        inserted++;
+      } catch (e) {
+        console.error('INVENTORY upsert error', invItemId, e && e.message ? e.message : e);
+      }
     }
+
+    console.log(`INVENTORY: processed ${totalInv}; mapped=${mapped}; autopopulated=${autopopulated}; inserted=${inserted}`);
 
     // ---------- 4) Orders via REST (robust Link-header paging)
     const daysBack = 60;
