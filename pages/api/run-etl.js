@@ -101,22 +101,34 @@ export default async function handler(req, res) {
       if (products.length > 3000) break; // safety cap
     }
 
-    // Upsert products + variants
-    for (const p of products) {
-      const firstImage = p.images && p.images.edges && p.images.edges[0] ? p.images.edges[0].node.src : null;
-      for (const vEdge of (p.variants && p.variants.edges) || []) {
-        const v = vEdge.node;
-        const sku = (v.sku || '').trim();
-        if (!sku) continue;
-        await client.query(
-          `INSERT INTO products (sku, title, product_id, variant_id, image, shopify_handle, retail_price, created_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-           ON CONFLICT (sku) DO UPDATE
-           SET title=EXCLUDED.title, product_id=EXCLUDED.product_id, variant_id=EXCLUDED.variant_id, image=EXCLUDED.image, shopify_handle=EXCLUDED.shopify_handle, retail_price=EXCLUDED.retail_price`,
-          [sku, p.title, p.id, v.id, firstImage, p.handle, v.price || 0, new Date()]
-        );
-      }
-    }
+    // Upsert products + variants (store variant_id and inventory_item_id as GraphQL GIDs numeric tail)
+for (const p of products) {
+  const firstImage = p.images && p.images.edges && p.images.edges[0] ? p.images.edges[0].node.src : null;
+  for (const vEdge of (p.variants && p.variants.edges) || []) {
+    const v = vEdge.node;
+    const sku = (v.sku || '').trim();
+    if (!sku) continue;
+
+    // inventoryItem id (GraphQL GID like gid://shopify/InventoryItem/123456789)
+    const invGid = (v.inventoryItem && v.inventoryItem.id) ? v.inventoryItem.id : null;
+    const invNumeric = invGid ? String(invGid).split('/').pop() : null;
+
+    await client.query(
+      `INSERT INTO products (sku, title, product_id, variant_id, inventory_item_id, image, shopify_handle, retail_price, created_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT (sku) DO UPDATE
+       SET title=EXCLUDED.title,
+           product_id=EXCLUDED.product_id,
+           variant_id=EXCLUDED.variant_id,
+           inventory_item_id=EXCLUDED.inventory_item_id,
+           image=EXCLUDED.image,
+           shopify_handle=EXCLUDED.shopify_handle,
+           retail_price=EXCLUDED.retail_price`,
+      [sku, p.title, p.id, v.id, invNumeric, firstImage, p.handle, v.price || 0, new Date()]
+    );
+  }
+}
+
 
     // ---------- 2) Locations (REST)
     try {
