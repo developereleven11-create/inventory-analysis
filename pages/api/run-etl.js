@@ -169,15 +169,14 @@ for (const p of products) {
       console.warn('Inventory fetch warning:', e && e.message ? e.message : e);
     }
 
-    // Build inv item id -> sku map from products.variant_id
-    const invItemToSku = {};
-    const skuRows = await client.query(`SELECT sku, variant_id FROM products WHERE variant_id IS NOT NULL`);
-    for (const r of skuRows.rows) {
-      const variantGid = r.variant_id || '';
-      const parts = variantGid.split('/');
-      const numeric = parts[parts.length - 1] || null;
-      if (numeric) invItemToSku[numeric.toString()] = r.sku;
-    }
+  // Build inventory_item_id -> sku map from products.inventory_item_id
+const invItemToSku = {};
+const skuRows = await client.query(`SELECT sku, inventory_item_id FROM products WHERE inventory_item_id IS NOT NULL`);
+for (const r of skuRows.rows) {
+  const invId = r.inventory_item_id ? String(r.inventory_item_id) : null;
+  if (invId) invItemToSku[invId] = r.sku;
+}
+
 
     for (const item of invLevels) {
       const invItemId = item.inventory_item_id ? String(item.inventory_item_id) : null;
